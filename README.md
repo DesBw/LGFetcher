@@ -6,9 +6,14 @@
 
 **LGFetcher** is a native Zotero plugin that searches Library Genesis (LibGen) mirrors for full-text books and research materials, lets you choose the most appropriate available copy, downloads the selected file, renames it, and attaches it directly to the corresponding Zotero item.
 
-## What’s New in Version 1.1.0
+## What’s New in Version 1.1.1
 
-LGFetcher v1.1.0 introduces a redesigned search-and-download workflow, configurable mirror and file-type settings, improved candidate filtering, a download-options window, streamed download progress, and automatic file storage and naming.
+- Allows installation in Zotero 10.0 while retaining the existing Zotero 9.0 compatibility and plugin ID.
+- Makes settings-pane registration and menu cleanup safer during startup, shutdown, and re-enabling.
+- Fixes searches for records without cover images, PDF page inspection, and handling of generic download responses.
+- Adds an XPI build script and automated tests.
+
+LGFetcher is a **plugin**, not a Zotero translator: it attaches a file to an existing bibliographic item rather than importing a new reference from LibGen.
 
 ---
 
@@ -38,13 +43,13 @@ LGFetcher v1.1.0 introduces a redesigned search-and-download workflow, configura
   - DJVU
   - MOBI
 
-  File-type preferences are configured from the same LGFetcher settings pane shown in [Figure 1](#figure-1-lgfetcher-settings).
+  File-type preferences are configured from the same LGFetcher settings pane shown in [Figure 1](#figure-1-lgfetcher-settings). **Current limitation:** the downloader accepts PDF and EPUB files only; DJVU and MOBI can appear in search results but cannot yet be downloaded.
 
 - **Multi-Mirror Redundancy:** If a configured mirror is unavailable, blocked, or returns no suitable results, LGFetcher automatically continues to the next mirror.
 
 - **Download Progress:** Files are streamed locally through the LGFetcher download window. When the server reports the total file size, LGFetcher displays byte-by-byte percentage progress. Downloads can be paused or canceled from the progress window.
 
-- **File Validation:** LGFetcher checks the downloaded file data to confirm that the server returned a supported document rather than an HTML error page or unusable response. Generic binary responses such as `application/octet-stream` are evaluated using the file signature, filename, selected format, and response URL.
+- **File Validation:** LGFetcher uses basic checks for common HTML error pages and PDF/EPUB responses. Generic binary responses such as `application/octet-stream` are evaluated using the file signature, filename, selected format, and response URL. These are heuristics, not a complete integrity or malware check.
 
 - **Automatic Storage and Attachment:** The selected file is downloaded into Zotero’s managed attachment storage and attached directly to the selected parent item.
 
@@ -58,7 +63,7 @@ LGFetcher v1.1.0 introduces a redesigned search-and-download workflow, configura
 
 - **Integrated Zotero Interface:** LGFetcher is available from the Zotero **Tools** menu and includes its own pane in **Zotero Settings**. See [Figures 1 and 2](#figures).
 
-- **Zotero Compatibility:** Supports Zotero 6, 7, 8, and 9.
+- **Zotero Compatibility:** This build targets Zotero 9.0 and 10.0. Its manifest does not support Zotero 6, 7, or 8.
 
 ---
 
@@ -148,12 +153,13 @@ The resulting stored attachment is shown in [Figure 4](#figure-4-downloaded-file
 
 ## 📁 Project Structure
 
-- **`manifest.json`**: Plugin manifest for the current Zotero extension system.
-- **`install.rdf`**: Legacy manifest used for compatibility with older Zotero versions.
-- **`bootstrap.js`**: Core plugin engine containing the Zotero interface integration, search logic, candidate ranking and filtering, mirror loop, download resolver, progress handling, file validation, renaming, and attachment import.
-- **`preferences.xhtml`**: LGFetcher settings pane for mirror URLs and file-type preferences.
-- **`selection.xhtml`**: Download-options window used to display and select matching copies.
-- **`icon.svg`**: LGFetcher interface icon used in Zotero menus, settings, and plugin management.
+- **`manifest.json`**: Plugin manifest and Zotero compatibility range.
+- **`bootstrap.js`**: Core plugin engine, UI integration, search, download, and attachment import.
+- **`preferences.xhtml` / `preferences-ui.js`**: LGFetcher settings pane.
+- **`selection.xhtml` / `selection.js`**: Additional selection-window resources.
+- **`icon.svg`**: LGFetcher interface icon.
+- **`scripts/build_xpi.py`**: Builds the installable plugin package; `scripts/build_xpi.js` is an optional npm wrapper.
+- **`tests/`**: Automated lifecycle, settings, packaging, and simulated download tests.
 
 ---
 
@@ -172,12 +178,35 @@ LGFetcher will use the updated list during the next search.
 
 ## Installation
 
-1. Download the latest LGFetcher `.xpi` release.
-2. Open Zotero.
-3. Go to **Tools → Plugins**.
-4. Open the plugin-management menu and select **Install Plugin From File…**
-5. Select the downloaded `.xpi` file.
-6. Restart Zotero if prompted.
+1. Download an LGFetcher 1.1.1 `.xpi` package, or [build one from source](#build-and-test).
+2. In Zotero 9 or 10, go to **Tools → Plugins**.
+3. Open the plugin-management menu and select **Install Plugin From File…**
+4. Select the `.xpi` file and restart Zotero if prompted.
+
+The plugin ID is unchanged, so installing over an earlier LGFetcher build retains its saved settings. Zotero requires an update URL in the manifest, but the existing URL is a placeholder, not a working update service; install future packages manually.
+
+## Build and Test
+
+Build an XPI with Python 3 (no Python packages are required):
+
+```bash
+python3 scripts/build_xpi.py
+```
+
+On Windows, use `py -3 scripts/build_xpi.py` instead. The package is created at `dist/LGFetcher-1.1.1.xpi`.
+
+To run the tests, install Python 3 and Node.js 20 or later and run:
+
+```bash
+npm ci
+npm test
+```
+
+`npm run build` is also available after installing Node.js. On Windows the npm scripts use the `py -3` launcher; if necessary, set `PYTHON` to the path of your Python 3 executable.
+
+The automated tests use simulated Zotero APIs and local mirror responses; they do **not** replace testing in Zotero itself. After installing in a separate Zotero 10 test profile, check the LGFetcher settings pane and Tools/context menus, then search for an item without an attachment, choose a PDF or EPUB, and verify that it is attached to the correct item. Also check cancellation and disabling/re-enabling the plugin. Mirror availability and access restrictions can affect the download independently of Zotero compatibility.
+
+The version range and affected APIs were reviewed against [Zotero 10 for Developers](https://www.zotero.org/support/dev/zotero_10_for_developers).
 
 ---
 

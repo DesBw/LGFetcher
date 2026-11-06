@@ -3,12 +3,13 @@ const MENU_ID_TOOLS = "lgfetcher-tools-menu-item";
 const MENU_LABEL = "LGFetcher - Find a Copy";
 let LGFetcherRootURI = null;
 let LGFetcherBusy = false;
+let LGFetcherStartupGeneration = 0;
 
 async function runLGFetcher(window, selectedItems = null) {
   const Zotero = window.Zotero;
   const DOMParser = window.DOMParser;
-  const Cc = window.Cc;
-  const Ci = window.Ci;
+  // Zotero provides Cc and Ci in the privileged plugin scope; they are not
+  // guaranteed to be properties of the main window.
   const fetch = window.fetch.bind(window);
   const HTTP = Zotero.HTTP;
   const AbortController = window.AbortController;
@@ -523,6 +524,7 @@ async function runLGFetcher(window, selectedItems = null) {
 
     const rowImages = Array.from(candidate.row.querySelectorAll("img"));
     const imageValue = img => {
+      if (!img) return "";
       const attrs = [
         "data-src", "data-original", "data-lazy-src", "data-url", "data-cover",
         "src", "srcset"
@@ -1012,7 +1014,7 @@ async function runLGFetcher(window, selectedItems = null) {
         if (!linkData || !linkData.candidateUrls.length) {
           results.push(`The selected LibGen record did not expose a working download link for "${rawTitle}".`);
         } else {
-          const downloadedFile = await streamToFileWithProgress(linkData.candidateUrls, linkData.refererUrl, itemProgress, downloadControl, candidateItem.format);
+          const downloadedFile = await streamToFileWithProgress(linkData.candidateUrls, linkData.refererUrl, itemProgress, downloadControl, selectedOption.format);
           if (!downloadedFile) {
             results.push(`The selected file could not be downloaded for "${rawTitle}".${downloadControl.lastDownloadError ? `\n\n${downloadControl.lastDownloadError}` : ""}`);
           } else {
@@ -1133,7 +1135,7 @@ async function runLGFetcher(window, selectedItems = null) {
       let fileStream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
       fileStream.init(file, 0x01, 0444, 0);
 
-      let binaryStream = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+      let binaryStream = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
       binaryStream.setInputStream(fileStream);
 
       let bytes = binaryStream.readBytes(fileStream.available());
@@ -1398,17 +1400,37 @@ async function runLGFetcher(window, selectedItems = null) {
           continue;
         }
 
-        await downloadControl.waitIfPaused();
-        resetInactivityTimer();
-        const first = await reader.read();
-        if (first.done || !first.value || first.value.length < 4) {
+        // Fetch streams can split the file signature across chunks. Buffer a
+        // small prefix before validation so neither a PDF header nor an HTML
+        // error page is missed just because of a short first chunk.
+        const bufferedChunks = [];
+        let bufferedLength = 0;
+        while (bufferedLength < 1024) {
+          await downloadControl.waitIfPaused();
+          resetInactivityTimer();
+          const part = await reader.read();
+          if (part.done) break;
+          if (part.value?.length) {
+            bufferedChunks.push(part.value);
+            bufferedLength += part.value.length;
+          }
+        }
+        if (bufferedLength < 4) {
           lastError = `The response from ${url} was empty`;
+          try { await reader.cancel(); } catch (e) {}
           continue;
         }
 
-        const firstBytes = first.value;
+        const firstBytes = new Uint8Array(Math.min(bufferedLength, 1024));
+        let sampleOffset = 0;
+        for (const chunk of bufferedChunks) {
+          const part = chunk.subarray(0, firstBytes.length - sampleOffset);
+          firstBytes.set(part, sampleOffset);
+          sampleOffset += part.length;
+          if (sampleOffset === firstBytes.length) break;
+        }
         let sample = "";
-        for (let i = 0; i < Math.min(firstBytes.length, 1024); i++) sample += String.fromCharCode(firstBytes[i]);
+        for (const byte of firstBytes) sample += String.fromCharCode(byte);
         const contentType = String(response.headers.get("content-type") || "").toLowerCase();
         const contentDisposition = String(response.headers.get("content-disposition") || "").toLowerCase();
         const declaredFormat = String(expectedFormat || "").toUpperCase();
@@ -1423,13 +1445,22 @@ async function runLGFetcher(window, selectedItems = null) {
         const filenameSaysEpub = /filename\*?=[^;]*\.epub(?:["';]|$)/i.test(contentDisposition)
           || /\.epub(?:$|[?#])/i.test(responseUrl);
 
+        // A mirror may return an HTML error page with a generic or misleading
+        // content type. Never save it as a document based only on the format.
+        const textSample = sample.replace(/^\xEF\xBB\xBF/, "").trimStart();
+        if (contentType.includes("text/html") || /^(?:<!--[\s\S]*?-->\s*)*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(textSample)) {
+          lastError = `The selected route returned an HTML page instead of a document`;
+          try { await reader.cancel(); } catch (e) {}
+          continue;
+        }
+
         // LibGen commonly serves valid files as application/octet-stream.
         // Trust document signatures first, then the selected catalog format
         // and Content-Disposition filename when the MIME type is generic.
-        const isPdf = hasPdfMagic
+        const isPdf = !hasZipMagic && (hasPdfMagic
           || contentType.includes("application/pdf")
           || filenameSaysPdf
-          || (isGenericBinary && declaredFormat === "PDF");
+          || (isGenericBinary && declaredFormat === "PDF"));
         const isEpub = !isPdf && (hasZipMagic
           || contentType.includes("epub")
           || filenameSaysEpub
@@ -1448,8 +1479,10 @@ async function runLGFetcher(window, selectedItems = null) {
         const bos = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);
         bos.setOutputStream(fos);
 
-        let loadedBytes = firstBytes.length;
-        bos.writeByteArray(Array.from(firstBytes), firstBytes.length);
+        let loadedBytes = bufferedLength;
+        for (const chunk of bufferedChunks) {
+          bos.writeByteArray(Array.from(chunk), chunk.length);
+        }
 
         const updateProgress = () => {
           const loadedMB = (loadedBytes / 1048576).toFixed(1);
@@ -1482,11 +1515,12 @@ async function runLGFetcher(window, selectedItems = null) {
         downloadControl.activeAbortController = null;
         return { path: tempFile.path, fileObj: tempFile, ext };
       } catch (e) {
-        if (inactivityTimer) clearTimeout(inactivityTimer);
-        downloadControl.activeAbortController = null;
         if (downloadControl.cancelled || e.message === "LGFETCHER_CANCELLED") throw new Error("LGFETCHER_CANCELLED");
         lastError = e.name === "AbortError" ? `The selected server stopped sending data for 30 seconds` : (e.message || String(e));
         Zotero.debug(`LGFetcher strict stream error from ${url}: ${lastError}`);
+      } finally {
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        if (downloadControl.activeAbortController === controller) downloadControl.activeAbortController = null;
       }
     }
 
@@ -1512,6 +1546,9 @@ function createXULMenuItem(doc, id, label, callback, iconURL = null) {
 }
 
 function onMainWindowLoad({ window }) {
+  // Zotero can call this hook as well as enumerate an already-open window
+  // during startup. Keep only one set of listeners so shutdown removes them all.
+  if (!LGFetcherRootURI || window._lgFetcherCtxHandler || window._lgFetcherToolsHandler) return;
   let doc = window.document;
 
   function getSelectedItems() {
@@ -1523,8 +1560,8 @@ function onMainWindowLoad({ window }) {
   function showLGFetcherAlert(message) {
     try {
       const promptService = window.Services?.prompt
-        || window.Cc["@mozilla.org/embedcomp/prompt-service;1"]
-          .getService(window.Ci.nsIPromptService);
+        || Cc["@mozilla.org/embedcomp/prompt-service;1"]
+          .getService(Ci.nsIPromptService);
       promptService.alert(window, "LGFetcher", String(message));
     } catch (e) {
       window.alert(String(message));
@@ -1549,9 +1586,9 @@ function onMainWindowLoad({ window }) {
     }
   }
 
-  function injectContextItem() {
+  function injectContextItem(event) {
     let popup = doc.getElementById("zotero-itemmenu");
-    if (!popup) return;
+    if (!popup || (event && event.target !== popup)) return;
 
     window._lgFetcherContextSelection = getSelectedItems();
     if (!doc.getElementById(MENU_ID_CONTEXT)) {
@@ -1563,9 +1600,9 @@ function onMainWindowLoad({ window }) {
     }
   }
 
-  function injectToolsItem() {
+  function injectToolsItem(event) {
     let popup = doc.getElementById("menu_ToolsPopup");
-    if (popup && !doc.getElementById(MENU_ID_TOOLS)) {
+    if (popup && (!event || event.target === popup) && !doc.getElementById(MENU_ID_TOOLS)) {
       let item = createXULMenuItem(doc, MENU_ID_TOOLS, MENU_LABEL, async () => {
         await execute(getSelectedItems());
       }, LGFetcherRootURI ? LGFetcherRootURI + "icon.svg" : null);
@@ -1613,35 +1650,11 @@ function onMainWindowUnload({ window }) {
 function install(data, reason) {}
 
 async function startup({ id, version, rootURI }, reason) {
+  const generation = ++LGFetcherStartupGeneration;
   LGFetcherRootURI = rootURI;
 
-  // A preferences-pane failure must never prevent the Tools/context commands from loading.
-  try {
-    Zotero.PreferencePanes.register({
-      id: "lgfetcher-preferences",
-      pluginID: id,
-      src: rootURI + "preferences.xhtml",
-      scripts: [rootURI + "preferences-ui.js"],
-      label: "LGFetcher",
-      image: rootURI + "icon.svg"
-    });
-  } catch (e) {
-    Zotero.logError(e);
-  }
-
-  try {
-    await Zotero.uiReadyPromise;
-  } catch (e) {
-    Zotero.logError(e);
-  }
-
-  for (let win of Zotero.getMainWindows()) {
-    try { onMainWindowLoad({ window: win }); }
-    catch (e) { Zotero.logError(e); }
-  }
-
-  // Seed defaults after all UI registration so preference initialization
-  // can never prevent the Settings pane or menu commands from loading.
+  // Seed only missing preferences, before a window can use them. Existing
+  // mirror and format settings must survive an upgrade.
   try {
     const defaults = {
       "extensions.lgfetcher.mirrors": "https://libgen.li\nhttps://libgen.la\nhttps://libgen.gl\nhttps://libgen.bz\nhttps://libgen.vg\nhttps://libgen.is",
@@ -1658,11 +1671,51 @@ async function startup({ id, version, rootURI }, reason) {
   } catch (e) {
     Zotero.logError(e);
   }
+
+  // register() is asynchronous in Zotero 9/10. Catch a rejected promise so
+  // a preferences-pane failure cannot prevent the menu commands from loading.
+  let paneID;
+  try {
+    paneID = await Zotero.PreferencePanes.register({
+      id: "lgfetcher-preferences",
+      pluginID: id,
+      src: rootURI + "preferences.xhtml",
+      scripts: [rootURI + "preferences-ui.js"],
+      label: "LGFetcher",
+      image: rootURI + "icon.svg"
+    });
+  } catch (e) {
+    Zotero.logError(e);
+  }
+
+  // Do not inject UI after the plugin was disabled while registration or UI
+  // initialization was pending. Zotero normally unregisters panes on shutdown;
+  // handle the case where registration finishes after that notification too.
+  if (generation !== LGFetcherStartupGeneration) {
+    if (!LGFetcherRootURI && paneID && Zotero.PreferencePanes.unregister) {
+      Zotero.PreferencePanes.unregister(paneID);
+    }
+    return;
+  }
+
+  try {
+    await Zotero.uiReadyPromise;
+  } catch (e) {
+    Zotero.logError(e);
+  }
+  if (generation !== LGFetcherStartupGeneration) return;
+
+  for (let win of Zotero.getMainWindows()) {
+    try { onMainWindowLoad({ window: win }); }
+    catch (e) { Zotero.logError(e); }
+  }
 }
 
 function shutdown({ id, version, rootURI }, reason) {
+  ++LGFetcherStartupGeneration;
   for (let win of Zotero.getMainWindows()) {
-    onMainWindowUnload({ window: win });
+    try { onMainWindowUnload({ window: win }); }
+    catch (e) { Zotero.logError(e); }
   }
   LGFetcherRootURI = null;
 }
